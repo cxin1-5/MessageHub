@@ -1,0 +1,8 @@
+手机构建说明
+1. 在 github.com/signup 注册并验证邮箱。
+2. 在 github.com/new 创建私人仓库 MessageHub-Android，勾选 Add a README file。
+3. 手机解压本压缩包；GitHub 网页仓库 Add file -> Upload files 上传 MessageHub 文件夹内项目文件，保持 app/src/main 等目录结构；若手机浏览器无法上传文件夹，可用 GitHub 网页逐级创建文件或使用支持 Git 的手机客户端。
+4. 特别确认 .github/workflows/build-apk.yml 已上传，且 build.gradle.kts、settings.gradle.kts 位于仓库根目录（不要额外套一层 MessageHub）。
+5. 仓库 Actions -> Build MessageHub APK -> Run workflow；等待完成。
+6. 在成功的运行页面底部 Artifacts 下载 MessageHub-debug-apk，解压得到 app-debug.apk，安装到 Android 手机。
+注意：当前项目未经实际云端构建测试；若失败需查看 Actions 日志。安装前核对代码来源，不要将个人聊天导出文件上传 GitHub。
