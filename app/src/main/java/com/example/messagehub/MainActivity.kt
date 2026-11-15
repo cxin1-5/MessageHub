@@ -53,7 +53,12 @@ class MainActivity : Activity() {
         val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
         rows.forEach { m ->
             root.addView(line("${fmt.format(Date(m.timestamp))}  ${m.platform} · ${m.sender}\n${m.category}  ${m.mention}  [${m.origin}]\n${m.body.take(280)}"))
-            root.addView(View(this).apply { setBackgroundColor(0xFFDDDDDD.toInt()); layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) })
+                val separator = android.view.View(this)
+                separator.setBackgroundColor(0xFFDDDDDD.toInt())
+                separator.layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, 1
+                )
+                root.addView(separator)
         }
     }
     @Deprecated("Uses document picker result for broad Android compatibility")
