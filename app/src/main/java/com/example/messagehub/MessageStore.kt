@@ -8,16 +8,16 @@ import java.security.MessageDigest
 
 data class MessageRow(val id: Long, val platform: String, val sender: String, val body: String, val category: String, val mention: String, val timestamp: Long, val origin: String)
 
-class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 2) {
+class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, category TEXT NOT NULL, mention TEXT NOT NULL, timestamp INTEGER NOT NULL, origin TEXT NOT NULL, fingerprint TEXT UNIQUE NOT NULL)")
         createV2Tables(db)
+        createV3Tables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion < 2) {
-            createV2Tables(db)
-        }
+        if (oldVersion < 2) createV2Tables(db)
+        if (oldVersion < 3) createV3Tables(db)
     }
 
     private fun createV2Tables(db: SQLiteDatabase) {
@@ -78,6 +78,109 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 2)
         )
     }
 
+
+    private fun createV3Tables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS v3_threads (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, thread_key TEXT NOT NULL, title TEXT NOT NULL, kind TEXT NOT NULL, UNIQUE(platform,thread_key))")
+        db.execSQL("CREATE TABLE IF NOT EXISTS v3_links (platform TEXT NOT NULL, account_key TEXT NOT NULL, contact_id INTEGER NOT NULL, PRIMARY KEY(platform,account_key))")
+        db.execSQL("CREATE TABLE IF NOT EXISTS v3_flags (message_id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, direction TEXT NOT NULL DEFAULT 'IN', mention_confirmed INTEGER NOT NULL DEFAULT 0)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_v3_flags_thread ON v3_flags(thread_id)")
+    }
+    data class Folder(val id: Long, val title: String, val platform: String, val kind: String, val count: Int)
+    fun folders(kind: String): List<Folder> {
+        val out = mutableListOf<Folder>()
+        readableDatabase.rawQuery("SELECT t.id,t.title,t.platform,t.kind,COUNT(f.message_id) FROM v3_threads t LEFT JOIN v3_flags f ON f.thread_id=t.id WHERE t.kind=? GROUP BY t.id ORDER BY t.title", arrayOf(kind)).use { c ->
+            while(c.moveToNext()) out.add(Folder(c.getLong(0),c.getString(1),c.getString(2),c.getString(3),c.getInt(4)))
+        }
+        return out
+    }
+    fun threadMessages(id: Long): List<MessageRow> {
+        val out=mutableListOf<MessageRow>()
+        readableDatabase.rawQuery("SELECT m.id,m.platform,m.sender,m.body,m.category,m.mention,m.timestamp,m.origin FROM messages m JOIN v3_flags f ON f.message_id=m.id WHERE f.thread_id=? ORDER BY m.timestamp DESC,m.id DESC LIMIT 1000",arrayOf(id.toString())).use { c ->
+            while(c.moveToNext()) out.add(MessageRow(c.getLong(0),c.getString(1),c.getString(2),c.getString(3),c.getString(4),c.getString(5),c.getLong(6),c.getString(7)))
+        }
+        return out
+    }
+    fun mentions(): List<MessageRow> {
+        val out=mutableListOf<MessageRow>()
+        readableDatabase.rawQuery("SELECT m.id,m.platform,m.sender,m.body,m.category,m.mention,m.timestamp,m.origin FROM messages m JOIN v3_flags f ON f.message_id=m.id JOIN v3_threads t ON t.id=f.thread_id WHERE t.kind='GROUP' AND f.mention_confirmed=1 ORDER BY m.timestamp DESC LIMIT 500",null).use { c ->
+            while(c.moveToNext()) out.add(MessageRow(c.getLong(0),c.getString(1),c.getString(2),c.getString(3),c.getString(4),c.getString(5),c.getLong(6),c.getString(7)))
+        }
+        return out
+    }
+    fun addV3(platform:String, sender:String, body:String, timestamp:Long, origin:String, threadTitle:String=sender, kind:String="PERSON", outgoing:Boolean=false, explicitMention:Boolean=false):Boolean {
+        if(body.isBlank()) return false
+        val db=writableDatabase
+        val key=threadTitle.trim().ifBlank { "未知会话" }
+        val safeKind=if(kind=="GROUP") "GROUP" else if(kind=="PERSON") "PERSON" else "UNKNOWN"
+        db.beginTransaction()
+        try {
+            val tv=ContentValues().apply { put("platform",platform);put("thread_key",key);put("title",key);put("kind",safeKind) }
+            db.insertWithOnConflict("v3_threads",null,tv,SQLiteDatabase.CONFLICT_IGNORE)
+            var tid=0L
+            db.rawQuery("SELECT id FROM v3_threads WHERE platform=? AND thread_key=?",arrayOf(platform,key)).use { c -> if(c.moveToFirst()) tid=c.getLong(0) }
+            val fingerprint=MessageDigest.getInstance("SHA-256").digest("$platform\u0000$sender\u0000$body\u0000$timestamp\u0000$origin".toByteArray()).joinToString(""){ "%02x".format(it) }
+            val mv=ContentValues().apply {put("platform",platform);put("sender",sender);put("body",body.take(10000));put("category",Classifier.category(body));put("mention",Classifier.mention(body,explicitMention));put("timestamp",timestamp);put("origin",origin);put("fingerprint",fingerprint);put("conversation_id",tid);put("direction",if(outgoing) "OUT" else "IN")}
+            var mid=db.insertWithOnConflict("messages",null,mv,SQLiteDatabase.CONFLICT_IGNORE)
+            val inserted=mid!=-1L
+            if(!inserted) db.rawQuery("SELECT id FROM messages WHERE fingerprint=?",arrayOf(fingerprint)).use { c -> if(c.moveToFirst()) mid=c.getLong(0) }
+            if(mid>0) {
+                val fv=ContentValues().apply {put("message_id",mid);put("thread_id",tid);put("direction",if(outgoing) "OUT" else "IN");put("mention_confirmed",if(explicitMention && safeKind=="GROUP") 1 else 0)}
+                db.insertWithOnConflict("v3_flags",null,fv,SQLiteDatabase.CONFLICT_IGNORE)
+            }
+            db.setTransactionSuccessful()
+            return inserted
+        } finally {db.endTransaction()}
+    }
+    fun deleteOne(id:Long):Boolean {
+        val db=writableDatabase
+        db.beginTransaction()
+        try {db.delete("v3_flags","message_id=?",arrayOf(id.toString())); val ok=db.delete("messages","id=?",arrayOf(id.toString()))>0;db.setTransactionSuccessful();return ok} finally {db.endTransaction()}
+    }
+    fun mergeAccounts(name:String, accounts:List<Pair<String,String>>):Boolean {
+        if(name.isBlank() || accounts.isEmpty()) return false
+        val db=writableDatabase
+        db.beginTransaction()
+        try {
+            val cv=ContentValues().apply {put("display_name",name.trim());put("created_at",System.currentTimeMillis())}
+            val id=db.insert("contacts",null,cv)
+            if(id<0) return false
+            for((platform,key) in accounts) {
+                if(key.isBlank()) continue
+                val a=ContentValues().apply {put("platform",platform);put("account_key",key.trim());put("contact_id",id)}
+                db.insertWithOnConflict("v3_links",null,a,SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            db.setTransactionSuccessful();return true
+        } finally {db.endTransaction()}
+    }
+    fun unifiedContacts():List<Pair<String,List<Folder>>> {
+        val result=mutableListOf<Pair<String,List<Folder>>>()
+        readableDatabase.rawQuery("SELECT id,display_name FROM contacts ORDER BY display_name",null).use { c ->
+            while(c.moveToNext()) {
+                val id=c.getLong(0);val name=c.getString(1)
+                val items=mutableListOf<Folder>()
+                readableDatabase.rawQuery("SELECT t.id,t.title,t.platform,t.kind,(SELECT COUNT(*) FROM v3_flags f WHERE f.thread_id=t.id) FROM v3_threads t JOIN v3_links l ON l.platform=t.platform AND l.account_key=t.thread_key WHERE l.contact_id=?",arrayOf(id.toString())).use { x -> while(x.moveToNext()) items.add(Folder(x.getLong(0),x.getString(1),x.getString(2),x.getString(3),x.getInt(4))) }
+                result.add(name to items)
+            }
+        }
+        return result
+    }
+    fun migrateOldMessages() {
+        val old=list(100000)
+        val db=writableDatabase
+        for(m in old) {
+            var exists=false
+            db.rawQuery("SELECT 1 FROM v3_flags WHERE message_id=?",arrayOf(m.id.toString())).use { c -> exists=c.moveToFirst() }
+            if(exists) continue
+            val key=m.sender.trim().ifBlank { "未知联系人" }
+            val tv=ContentValues().apply {put("platform",m.platform);put("thread_key",key);put("title",key);put("kind","UNKNOWN")}
+            db.insertWithOnConflict("v3_threads",null,tv,SQLiteDatabase.CONFLICT_IGNORE)
+            db.rawQuery("SELECT id FROM v3_threads WHERE platform=? AND thread_key=?",arrayOf(m.platform,key)).use { c -> if(c.moveToFirst()) {
+                val fv=ContentValues().apply {put("message_id",m.id);put("thread_id",c.getLong(0));put("direction","UNKNOWN");put("mention_confirmed",0)}
+                db.insertWithOnConflict("v3_flags",null,fv,SQLiteDatabase.CONFLICT_IGNORE)
+            }}
+        }
+    }
+
     fun deleteMessage(id: Long): Boolean {
         return writableDatabase.delete(
             "messages",
@@ -108,7 +211,7 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 2)
         readableDatabase.rawQuery("SELECT platform,COUNT(*) FROM messages GROUP BY platform", null).use { c -> while(c.moveToNext()) map[c.getString(0)] = c.getInt(1) }
         return map
     }
-    fun clearAll() { writableDatabase.delete("messages", null, null) }
+    fun clearAll() { val db=writableDatabase; db.delete("v3_flags",null,null);db.delete("messages",null,null) }
 }
 object Classifier {
     fun category(s: String): String {

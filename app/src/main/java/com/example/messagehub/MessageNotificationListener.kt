@@ -13,15 +13,18 @@ class MessageNotificationListener : NotificationListenerService() {
             "com.whatsapp", "com.whatsapp.w4b" -> "WhatsApp"
             else -> return
         }
-        val n = sbn.notification
-        if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
-        val e = n.extras
-        val sender = e.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = e.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
-            ?: e.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-        if (text.isBlank() || sender.isBlank()) return
-        // Notification metadata varies by app/version; @ detection is conservative.
-        val mention = text.contains("@我") || text.contains("mentioned you", true)
-        MessageStore(this).add(platform, sender, text, sbn.postTime, "通知", mention)
+        val n=sbn.notification
+        if ((n.flags and Notification.FLAG_GROUP_SUMMARY)!=0) return
+        val e=n.extras
+        val title=e.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val body=(e.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: e.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
+        if(title.isBlank() || body.isBlank()) return
+        // Only use group identity when the notification explicitly supplies a conversation title.
+        val conversation=e.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim().orEmpty()
+        val group=conversation.isNotBlank()
+        val sender=if(group) title else title
+        val thread=if(group) conversation else title
+        val explicit=group && (body.contains("@我") || body.contains("mentioned you",true) || body.contains("提到了你"))
+        MessageStore(this).addV3(platform,sender,body,sbn.postTime,"通知",thread,if(group) "GROUP" else "PERSON",false,explicit)
     }
 }
