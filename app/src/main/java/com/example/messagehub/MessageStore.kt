@@ -8,16 +8,18 @@ import java.security.MessageDigest
 
 data class MessageRow(val id: Long, val platform: String, val sender: String, val body: String, val category: String, val mention: String, val timestamp: Long, val origin: String)
 
-class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3) {
+class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 4) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, category TEXT NOT NULL, mention TEXT NOT NULL, timestamp INTEGER NOT NULL, origin TEXT NOT NULL, fingerprint TEXT UNIQUE NOT NULL)")
         createV2Tables(db)
         createV3Tables(db)
+        createV4Tables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createV2Tables(db)
         if (oldVersion < 3) createV3Tables(db)
+        if (oldVersion < 4) createV4Tables(db)
     }
 
     private fun createV2Tables(db: SQLiteDatabase) {
@@ -85,6 +87,43 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3)
         db.execSQL("CREATE TABLE IF NOT EXISTS v3_flags (message_id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, direction TEXT NOT NULL DEFAULT 'IN', mention_confirmed INTEGER NOT NULL DEFAULT 0)")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_v3_flags_thread ON v3_flags(thread_id)")
     }
+    private fun createV4Tables(db: SQLiteDatabase) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_v4_threads_kind ON v3_threads(platform,kind,thread_key)")
+        reconcileThreads(db)
+    }
+
+    /** Preserve all messages while collapsing only exact normalized names within the same platform and kind. */
+    private fun reconcileThreads(db: SQLiteDatabase) {
+        data class T(val id: Long, val platform: String, val kind: String, val key: String, val title: String)
+        val threads = mutableListOf<T>()
+        db.rawQuery("SELECT id,platform,kind,thread_key,title FROM v3_threads ORDER BY id", null).use { c ->
+            while (c.moveToNext()) threads.add(T(c.getLong(0),c.getString(1),c.getString(2),c.getString(3),c.getString(4)))
+        }
+        val canonical = mutableMapOf<String, Long>()
+        for (t in threads) {
+            val clean = ConversationNames.clean(t.title)
+            val normalized = ConversationNames.key(clean)
+            val scope = t.platform + "\u0000" + t.kind + "\u0000" + normalized
+            val target = canonical[scope]
+            if (target == null) {
+                canonical[scope] = t.id
+                db.execSQL("UPDATE v3_threads SET title=? WHERE id=?", arrayOf(clean,t.id))
+            } else {
+                db.execSQL("UPDATE v3_flags SET thread_id=? WHERE thread_id=?", arrayOf(target,t.id))
+                db.execSQL("UPDATE messages SET conversation_id=? WHERE conversation_id=?", arrayOf(target,t.id))
+                db.execSQL("DELETE FROM v3_threads WHERE id=?", arrayOf(t.id))
+            }
+        }
+        // Existing legacy keys are retained as aliases; incoming records resolve by normalized title.
+    }
+
+    /** Can be run repeatedly, including on databases already upgraded to V4. */
+    fun normalizeExistingFolders() {
+        val db = writableDatabase
+        db.beginTransaction()
+        try { reconcileThreads(db); db.setTransactionSuccessful() } finally { db.endTransaction() }
+    }
+
     data class Folder(val id: Long, val title: String, val platform: String, val kind: String, val count: Int)
     fun folders(kind: String): List<Folder> {
         val out = mutableListOf<Folder>()
@@ -110,14 +149,19 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3)
     fun addV3(platform:String, sender:String, body:String, timestamp:Long, origin:String, threadTitle:String=sender, kind:String="PERSON", outgoing:Boolean=false, explicitMention:Boolean=false):Boolean {
         if(body.isBlank()) return false
         val db=writableDatabase
-        val key=threadTitle.trim().ifBlank { "未知会话" }
+        val normalizedKey=ConversationNames.key(threadTitle)
         val safeKind=if(kind=="GROUP") "GROUP" else if(kind=="PERSON") "PERSON" else "UNKNOWN"
+        val key=safeKind + ":" + normalizedKey
         db.beginTransaction()
         try {
-            val tv=ContentValues().apply { put("platform",platform);put("thread_key",key);put("title",key);put("kind",safeKind) }
-            db.insertWithOnConflict("v3_threads",null,tv,SQLiteDatabase.CONFLICT_IGNORE)
-            var tid=0L
-            db.rawQuery("SELECT id FROM v3_threads WHERE platform=? AND thread_key=?",arrayOf(platform,key)).use { c -> if(c.moveToFirst()) tid=c.getLong(0) }
+            val tv=ContentValues().apply { put("platform",platform);put("thread_key",key);put("title",ConversationNames.clean(threadTitle));put("kind",safeKind) }
+            var existingId = 0L
+            db.rawQuery("SELECT id,title FROM v3_threads WHERE platform=? AND kind=?", arrayOf(platform,safeKind)).use { c ->
+                while (c.moveToNext()) if (ConversationNames.key(c.getString(1)) == normalizedKey) { existingId=c.getLong(0); break }
+            }
+            if (existingId == 0L) db.insertWithOnConflict("v3_threads",null,tv,SQLiteDatabase.CONFLICT_IGNORE)
+            var tid=existingId
+            if (tid == 0L) db.rawQuery("SELECT id FROM v3_threads WHERE platform=? AND thread_key=?",arrayOf(platform,key)).use { c -> if(c.moveToFirst()) tid=c.getLong(0) }
             val fingerprint=MessageDigest.getInstance("SHA-256").digest("$platform\u0000$sender\u0000$body\u0000$timestamp\u0000$origin".toByteArray()).joinToString(""){ "%02x".format(it) }
             val mv=ContentValues().apply {put("platform",platform);put("sender",sender);put("body",body.take(10000));put("category",Classifier.category(body));put("mention",Classifier.mention(body,explicitMention));put("timestamp",timestamp);put("origin",origin);put("fingerprint",fingerprint);put("conversation_id",tid);put("direction",if(outgoing) "OUT" else "IN")}
             var mid=db.insertWithOnConflict("messages",null,mv,SQLiteDatabase.CONFLICT_IGNORE)
@@ -146,7 +190,7 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3)
             if(id<0) return false
             for((platform,key) in accounts) {
                 if(key.isBlank()) continue
-                val a=ContentValues().apply {put("platform",platform);put("account_key",key.trim());put("contact_id",id)}
+                val a=ContentValues().apply {put("platform",platform);put("account_key",ConversationNames.key(key));put("contact_id",id)}
                 db.insertWithOnConflict("v3_links",null,a,SQLiteDatabase.CONFLICT_REPLACE)
             }
             db.setTransactionSuccessful();return true
@@ -171,8 +215,8 @@ class MessageStore(ctx: Context) : SQLiteOpenHelper(ctx, "messages.db", null, 3)
             var exists=false
             db.rawQuery("SELECT 1 FROM v3_flags WHERE message_id=?",arrayOf(m.id.toString())).use { c -> exists=c.moveToFirst() }
             if(exists) continue
-            val key=m.sender.trim().ifBlank { "未知联系人" }
-            val tv=ContentValues().apply {put("platform",m.platform);put("thread_key",key);put("title",key);put("kind","UNKNOWN")}
+            val key="UNKNOWN:" + ConversationNames.key(m.sender)
+            val tv=ContentValues().apply {put("platform",m.platform);put("thread_key",key);put("title",ConversationNames.clean(m.sender));put("kind","UNKNOWN")}
             db.insertWithOnConflict("v3_threads",null,tv,SQLiteDatabase.CONFLICT_IGNORE)
             db.rawQuery("SELECT id FROM v3_threads WHERE platform=? AND thread_key=?",arrayOf(m.platform,key)).use { c -> if(c.moveToFirst()) {
                 val fv=ContentValues().apply {put("message_id",m.id);put("thread_id",c.getLong(0));put("direction","UNKNOWN");put("mention_confirmed",0)}

@@ -17,7 +17,7 @@ class MainActivity : Activity() {
     private lateinit var root: LinearLayout
     private val importCode = 101
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
-    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); store = MessageStore(this); store.migrateOldMessages(); showHome() }
+    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); store = MessageStore(this); store.migrateOldMessages(); store.normalizeExistingFolders(); showHome() }
     private fun line(text: String, bold: Boolean = false): TextView = TextView(this).apply {
         this.text = text; textSize = if (bold) 19f else 15f; setPadding(6, 12, 6, 12)
         if (bold) setTypeface(null, Typeface.BOLD)
@@ -29,7 +29,7 @@ class MainActivity : Activity() {
         setContentView(scroll)
         root.addView(line("消息汇总助手 · MessageHub", true))
         root.addView(line("仅在明确开启后收集通知；所有数据默认保存在手机本地。"))
-        root.addView(line("V3：旧消息先放入待分类；通知无法保证识别所有群聊、@我或自己发送的内容。"))
+        root.addView(line("V4：同平台同类型会话按规范化名称归并；旧消息先放入待分类；通知无法保证识别所有群聊、@我或自己发送的内容。"))
         val collect = Switch(this).apply { text = "允许本地收集新通知"; isChecked = prefs.getBoolean("collect", false) }
         collect.setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean("collect", checked).apply() }
         root.addView(collect)
